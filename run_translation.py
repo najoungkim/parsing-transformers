@@ -42,18 +42,21 @@ from transformers import (
     M2M100Tokenizer,
     Seq2SeqTrainer,
     Seq2SeqTrainingArguments,
+    T5Tokenizer,
     default_data_collator,
     set_seed,
 )
 from transformers.trainer_utils import get_last_checkpoint, is_main_process
 from transformers.utils import check_min_version
 
+_T5_EMB_SIZE = 32128
+_COGS_NEW_VOCAB_COUNT = 21
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 check_min_version("4.5.0.dev0")
 
 logger = logging.getLogger(__name__)
-
+os.environ["WANDB_DISABLED"] = "true"
 
 @dataclass
 class ModelArguments:
@@ -95,6 +98,18 @@ class ModelArguments:
             "with private models)."
         },
     )
+    add_new_vocab: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "File containing the novel tokens to add to the model vocabulary."
+        },
+    )
+    vocab_init_method: Optional[str] = field(
+        default="default",
+        metadata={
+            "help": "If add_new_vocab is not None, pick a method to initialize the new word embeddings. Either 'default' or 'avg'."
+        },
+    )
 
 
 @dataclass
@@ -126,6 +141,12 @@ class DataTrainingArguments:
             "help": "An optional input test data file to evaluate the metrics (sacreblue) on " "a jsonlines file."
         },
     )
+    iid_test_file: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "An optional input test data file (iid) to evaluate the metrics (sacreblue) on " "a jsonlines file."
+        },
+    )    
     overwrite_cache: bool = field(
         default=False, metadata={"help": "Overwrite the cached training and evaluation sets"}
     )
@@ -210,10 +231,10 @@ class DataTrainingArguments:
 
         if self.train_file is not None:
             extension = self.train_file.split(".")[-1]
-            assert extension == "json", "`train_file` should be a json file."
+            assert extension in ["json", "jsonl"], "`train_file` should be a json file."
         if self.validation_file is not None:
             extension = self.validation_file.split(".")[-1]
-            assert extension == "json", "`validation_file` should be a json file."
+            assert extension in ["json", "jsonl"], "`validation_file` should be a json file."
         if self.val_max_target_length is None:
             self.val_max_target_length = self.max_target_length
 
@@ -294,6 +315,9 @@ def main():
         if data_args.test_file is not None:
             data_files["test"] = data_args.test_file
             extension = data_args.test_file.split(".")[-1]
+        if data_args.iid_test_file is not None:
+            data_files["iid_test"] = data_args.iid_test_file
+            extension = data_args.iid_test_file.split(".")[-1]
         datasets = load_dataset(extension, data_files=data_files)
 
     # Load pretrained model and tokenizer
@@ -310,6 +334,7 @@ def main():
         use_fast=model_args.use_fast_tokenizer,
         revision=model_args.model_revision,
         use_auth_token=True if model_args.use_auth_token else None,
+        from_slow=not model_args.use_fast_tokenizer
     )
     if model_args.use_pretrained_weights:
         model = AutoModelForSeq2SeqLM.from_pretrained(
@@ -341,6 +366,47 @@ def main():
     else:
         print('Using the original embedding layer.')
 
+    # Add vocab
+    if model_args.add_new_vocab is not None:
+        new_vocabs = []
+        with open(model_args.add_new_vocab) as vocab_file:
+            for line in vocab_file:
+                w = line.rstrip('\n')
+#                new_vocabs.append('\u2581' + w)
+                new_vocabs.append(w)
+        for w in new_vocabs:
+            tokenizer.add_tokens([w])
+            print(f'Added {w} to vocab.')
+        model.resize_token_embeddings(_T5_EMB_SIZE + len(new_vocabs))
+        print(f'Added {len(new_vocabs)} vocabulary items.')
+ 
+#        for w_idx in range(0, _COGS_NEW_VOCAB_COUNT):
+#            tokenizer.add_tokens([f'[w_{w_idx}]'])
+#        model.resize_token_embeddings(_T5_EMB_SIZE + _COGS_NEW_VOCAB_COUNT)
+#        print(f'Added {_COGS_NEW_VOCAB_COUNT} vocabulary items.')
+
+        if model_args.vocab_init_method == 'avg':
+            print('Re-initializing new embeddings with average init.')
+            # Try https://nlp.stanford.edu/~johnhew/vocab-expansion.html
+            import torch
+            emb = model.get_input_embeddings()
+            print(emb.weight.data.shape)
+#            old_emb = emb.weight.data[:-_COGS_NEW_VOCAB_COUNT, :]
+            old_emb = emb.weight.data[:-len(new_vocabs), :]
+            mu = torch.mean(old_emb, dim=0)
+            n = old_emb.size()[0]
+            sigma = ((old_emb - mu).T @ (old_emb - mu)) / n
+            dist = torch.distributions.multivariate_normal.MultivariateNormal(
+                            mu, covariance_matrix=1e-5*sigma)
+            #new_emb = torch.stack(tuple((dist.sample() for _ in range(_COGS_NEW_VOCAB_COUNT))), dim=0)
+            new_emb = torch.stack(tuple((dist.sample() for _ in range(len(new_vocabs)))), dim=0)
+            #emb.weight.data[-_COGS_NEW_VOCAB_COUNT:,:] = new_emb
+            emb.weight.data[-len(new_vocabs):,:] = new_emb
+            model.set_input_embeddings(emb)
+            print(old_emb)
+            print(new_emb)
+        
+
     # print out model for inspection
     print(model)
 
@@ -348,7 +414,7 @@ def main():
     if model_args.model_parallel:
         import torch
         print('Using model parallel on {:d} GPUs'.format(torch.cuda.device_count()))
-        assert model_args.model_name_or_path in ['t5-11b', 't5-3b', 't5-large', 'google/mt5-xl', 'Rostlab/prot_t5_xl_bfd'], "Use model parallel only for sufficiently large models."
+#        assert model_args.model_name_or_path in ['t5-11b', 't5-3b', 't5-large', 'google/mt5-xl', 'Rostlab/prot_t5_xl_bfd'], "Use model parallel only for sufficiently large models."
         assert torch.cuda.device_count() > 1, "Model parallelism requires more than 1 GPU."
         if torch.cuda.device_count() == 4:
             device_map = {
@@ -395,6 +461,8 @@ def main():
         column_names = datasets["validation"].column_names
     elif training_args.do_predict:
         column_names = datasets["test"].column_names
+    elif data_args.iid_test_file is not None:
+        column_names = datasets["iid_test"].column_names
     else:
         logger.info("There is nothing to do. Please pass `do_train`, `do_eval` and/or `do_predict`.")
         return
@@ -484,6 +552,19 @@ def main():
             load_from_cache_file=not data_args.overwrite_cache,
         )
 
+    if data_args.iid_test_file is not None:
+        max_target_length = data_args.val_max_target_length
+        iid_test_dataset = datasets["iid_test"]
+        if data_args.max_test_samples is not None:
+            iid_test_dataset = iid_test_dataset.select(range(data_args.max_test_samples))
+        iid_test_dataset = iid_test_dataset.map(
+            preprocess_function,
+            batched=True,
+            num_proc=data_args.preprocessing_num_workers,
+            remove_columns=column_names,
+            load_from_cache_file=not data_args.overwrite_cache,
+        )
+
     # Data collator
     label_pad_token_id = -100 if data_args.ignore_pad_token_for_loss else tokenizer.pad_token_id
     if data_args.pad_to_max_length:
@@ -565,8 +646,9 @@ def main():
     if training_args.do_train:
         if last_checkpoint is not None:
             checkpoint = last_checkpoint
-        elif os.path.isdir(model_args.model_name_or_path):
-            checkpoint = model_args.model_name_or_path
+        # Need sanity check
+        # elif os.path.isdir(model_args.model_name_or_path):
+        #    checkpoint = model_args.model_name_or_path
         else:
             checkpoint = None
         train_result = trainer.train(resume_from_checkpoint=checkpoint)
@@ -631,7 +713,6 @@ def main():
         if data_args.benchmark == 'COGS':
             with open(data_args.gen_conditions_file, 'r') as f:
                 condition_list = json.load(f)
-
             exact_match_acc_by_condition = {}
             unique_conditions = list(set(condition_list))
             for cond in unique_conditions:
@@ -644,7 +725,7 @@ def main():
             logger.info("Exact match accuries by condition: %s", exact_match_acc_by_condition)
 
             # save results
-            save_filename = 'accuracies_{}.json'.format(training_args.output_dir)
+            save_filename = os.path.join(training_args.output_dir, f'accuracies_{os.path.basename(training_args.output_dir)}.json')
 
             with open(save_filename, 'w') as f:
                 json.dump(exact_match_acc_by_condition, f)
@@ -664,11 +745,62 @@ def main():
         # generate predictions 
         if trainer.is_world_process_zero():
             if training_args.predict_with_generate:
-                test_preds = tokenizer.batch_decode(test_results.predictions, skip_special_tokens=True, clean_up_tokenization_spaces=True)
+                test_preds = tokenizer.batch_decode(test_results.predictions, skip_special_tokens=True, clean_up_tokenization_spaces=False)
                 test_preds = [pred.strip() for pred in test_preds]
-                output_test_preds_file = os.path.join(training_args.output_dir, "gen_generations.txt")
+                test_labels = tokenizer.batch_decode(test_labels, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+                test_labels = [pred.strip() for pred in test_labels]
+                output_test_preds_file = os.path.join(training_args.output_dir, "gen_generations.tsv")
                 with open(output_test_preds_file, "w") as writer:
-                    writer.write("\n".join(test_preds))
+                    writer.write('prediction\tgold\n')
+                    for pred, label in zip(test_preds, test_labels):
+                        writer.write(f'{pred}\t{label}\n')
+        
+    if data_args.iid_test_file is not None:
+        logger.info("*** IID Test ***")
+
+        iid_test_results = trainer.predict(
+            iid_test_dataset,
+            metric_key_prefix="iid_test",
+            max_length=data_args.val_max_target_length,
+            num_beams=data_args.num_beams,
+        )
+        metrics = iid_test_results.metrics
+        max_iid_test_samples = data_args.max_test_samples if data_args.max_test_samples is not None else len(iid_test_results)
+        metrics["iid_test_samples"] = min(max_iid_test_samples, len(iid_test_dataset))
+
+        trainer.log_metrics("iid_test", metrics)
+        trainer.save_metrics("iid_test", metrics)
+
+        # compute exact match accuracies by condition
+        iid_test_labels = iid_test_results.label_ids
+        if data_args.ignore_pad_token_for_loss:
+            # Replace -100 in the labels as we can't decode them.
+            iid_test_labels = np.where(iid_test_labels != -100, iid_test_labels, tokenizer.pad_token_id)
+
+        iid_test_predictions = iid_test_results.predictions[:, 1:]
+        if isinstance(iid_test_predictions, tuple):
+            iid_test_predictions = iid_test_predictions[0]
+
+        print('Predictions:', iid_test_predictions)
+        print('Labels:', iid_test_labels)
+
+        iid_accuracy_per_sequence = sequence_accuracy(iid_test_predictions, iid_test_labels, pad_token_id=tokenizer.pad_token_id)
+        iid_exact_matches = (iid_accuracy_per_sequence == 1.)    
+        iid_exact_match_acc = iid_exact_matches.sum() / len(iid_exact_matches)
+        logger.info("Exact match accuracy: %s", iid_exact_match_acc)   
+        iid_save_filename = os.path.join(training_args.output_dir, f'accuracies_iid_test_{os.path.basename(training_args.output_dir)}.json')
+
+        with open(iid_save_filename, 'w') as f:
+            json.dump({'iid_test': iid_exact_match_acc}, f)
+
+        # generate predictions 
+        if trainer.is_world_process_zero():
+            if training_args.predict_with_generate:
+                iid_test_preds = tokenizer.batch_decode(iid_test_results.predictions, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+                iid_test_preds = [pred.strip() for pred in iid_test_preds]
+                output_iid_test_preds_file = os.path.join(training_args.output_dir, "iid_test_generations.txt")
+                with open(output_iid_test_preds_file, "w") as writer:
+                    writer.write("\n".join(iid_test_preds))            
 
     return results
 
@@ -680,3 +812,4 @@ def _mp_fn(index):
 
 if __name__ == "__main__":
     main()
+
