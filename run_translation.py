@@ -35,6 +35,7 @@ from transformers import (
     AutoTokenizer,
     DataCollatorForSeq2Seq,
     HfArgumentParser,
+    BartTokenizer,
     MBartTokenizer,
     MBartTokenizerFast,
     MBart50Tokenizer,
@@ -50,6 +51,7 @@ from transformers.trainer_utils import get_last_checkpoint, is_main_process
 from transformers.utils import check_min_version
 
 _T5_EMB_SIZE = 32128
+_BART_EMB_SIZE = 50265
 _COGS_NEW_VOCAB_COUNT = 21
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
@@ -102,6 +104,12 @@ class ModelArguments:
         default=None,
         metadata={
             "help": "File containing the novel tokens to add to the model vocabulary."
+        },
+    )
+    prepend_space_to_vocab: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to prepend whitespace token to added vocabulary. Only meaningful when add_new_vocab is not None."
         },
     )
     vocab_init_method: Optional[str] = field(
@@ -372,12 +380,24 @@ def main():
         with open(model_args.add_new_vocab) as vocab_file:
             for line in vocab_file:
                 w = line.rstrip('\n')
-#                new_vocabs.append('\u2581' + w)
-                new_vocabs.append(w)
+                if model_args.prepend_space_to_vocab:
+                    if 't5' in model_args.model_name_or_path:
+                        new_vocabs.append(' ' + w)
+                    elif 'bart' in model_args.model_name_or_path:
+                        new_vocabs.append('\u0120' + w)
+                else:
+                    new_vocabs.append(w)
         for w in new_vocabs:
             tokenizer.add_tokens([w])
             print(f'Added {w} to vocab.')
-        model.resize_token_embeddings(_T5_EMB_SIZE + len(new_vocabs))
+
+        if 't5' in model_args.model_name_or_path:
+            model.resize_token_embeddings(_T5_EMB_SIZE + len(new_vocabs))
+        elif 'bart' in model_args.model_name_or_path:
+            model.resize_token_embeddings(_BART_EMB_SIZE + len(new_vocabs))
+        else:
+            raise ValueError('Only T5 and BART are currently supported for vocab resizing.')
+
         print(f'Added {len(new_vocabs)} vocabulary items.')
  
 #        for w_idx in range(0, _COGS_NEW_VOCAB_COUNT):
