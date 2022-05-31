@@ -760,8 +760,7 @@ def main():
                     exact_match_acc_by_condition["overall"] = exact_matches.sum() / len(exact_matches)
 
                     logger.info("Exact match accuries by condition: %s", exact_match_acc_by_condition)
-                    exact_match_acc = exact_matches.sum() / len(exact_matches)
-                    logger.info(f"Exact match accuracy for {test_dataset_name}: {exact_match_acc}")
+                    logger.info(f"Exact match accuracy for {test_dataset_name}: {exact_match_acc_by_condition['overall']}")
  
                     with open(save_filename, 'w') as f:
                         json.dump(exact_match_acc_by_condition, f)
