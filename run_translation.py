@@ -52,7 +52,7 @@ from transformers.utils import check_min_version
 
 _T5_EMB_SIZE = 32128
 _BART_EMB_SIZE = 50265
-_COGS_NEW_VOCAB_COUNT = 21
+_VALID_TEST_DATASET_NAMES = ["gen", "iid_test", "exposure_examples", "iid_test_novel_words"]
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 check_min_version("4.5.0.dev0")
@@ -155,6 +155,12 @@ class DataTrainingArguments:
             "help": "An optional input test data file (iid) to evaluate the metrics (sacreblue) on " "a jsonlines file."
         },
     )
+    iid_test_novel_words_file: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "An optional input test data file (iid, novel words) to evaluate the metrics (sacreblue) on " "a jsonlines file."
+        },
+    )    
     exposure_examples_file: Optional[str] = field(
         default=None,
         metadata={
@@ -327,11 +333,17 @@ def main():
             data_files["validation"] = data_args.validation_file
             extension = data_args.validation_file.split(".")[-1]
         if data_args.test_file is not None:
-            data_files["test"] = data_args.test_file
+            if data_args.benchmark == 'COGS':
+                data_files["gen"] = data_args.test_file
+            else:
+                data_files["test"] = data_args.test_file
             extension = data_args.test_file.split(".")[-1]
         if data_args.iid_test_file is not None:
             data_files["iid_test"] = data_args.iid_test_file
             extension = data_args.iid_test_file.split(".")[-1]
+        if data_args.iid_test_novel_words_file is not None:
+            data_files["iid_test_novel_words"] = data_args.iid_test_novel_words_file
+            extension = data_args.iid_test_novel_words_file.split(".")[-1]            
         if data_args.exposure_examples_file is not None:
             data_files["exposure_examples"] = data_args.exposure_examples_file
             extension = data_args.exposure_examples_file.split(".")[-1]
@@ -405,11 +417,6 @@ def main():
             raise ValueError('Only T5 and BART are currently supported for vocab resizing.')
 
         print(f'Added {len(new_vocabs)} vocabulary items.')
- 
-#        for w_idx in range(0, _COGS_NEW_VOCAB_COUNT):
-#            tokenizer.add_tokens([f'[w_{w_idx}]'])
-#        model.resize_token_embeddings(_T5_EMB_SIZE + _COGS_NEW_VOCAB_COUNT)
-#        print(f'Added {_COGS_NEW_VOCAB_COUNT} vocabulary items.')
 
         if model_args.vocab_init_method == 'avg':
             print('Re-initializing new embeddings with average init.')
@@ -417,16 +424,13 @@ def main():
             import torch
             emb = model.get_input_embeddings()
             print(emb.weight.data.shape)
-#            old_emb = emb.weight.data[:-_COGS_NEW_VOCAB_COUNT, :]
             old_emb = emb.weight.data[:-len(new_vocabs), :]
             mu = torch.mean(old_emb, dim=0)
             n = old_emb.size()[0]
             sigma = ((old_emb - mu).T @ (old_emb - mu)) / n
             dist = torch.distributions.multivariate_normal.MultivariateNormal(
                             mu, covariance_matrix=1e-5*sigma)
-            #new_emb = torch.stack(tuple((dist.sample() for _ in range(_COGS_NEW_VOCAB_COUNT))), dim=0)
             new_emb = torch.stack(tuple((dist.sample() for _ in range(len(new_vocabs)))), dim=0)
-            #emb.weight.data[-_COGS_NEW_VOCAB_COUNT:,:] = new_emb
             emb.weight.data[-len(new_vocabs):,:] = new_emb
             model.set_input_embeddings(emb)
             print(old_emb)
@@ -486,11 +490,17 @@ def main():
     elif training_args.do_eval:
         column_names = datasets["validation"].column_names
     elif training_args.do_predict:
-        column_names = datasets["test"].column_names
-    elif data_args.iid_test_file is not None:
-        column_names = datasets["iid_test"].column_names
-    elif data_args.exposure_examples_file is not None:
-        column_names = datasets["exposure_examples"].column_names
+        if data_args.benchmark == 'COGS':
+            if data_args.test_file is not None:
+                column_names = datasets["gen"].column_names
+            elif data_args.iid_test_file is not None:
+                column_names = datasets["iid_test"].column_names
+            elif data_args.iid_test_novel_words_file is not None:
+                column_names = datasets["iid_test_novel_words"].column_names        
+            elif data_args.exposure_examples_file is not None:
+                column_names = datasets["exposure_examples"].column_names
+        else:
+            column_names = datasets["test"].column_names
     else:
         logger.info("There is nothing to do. Please pass `do_train`, `do_eval` and/or `do_predict`.")
         return
@@ -566,44 +576,24 @@ def main():
         )
 
     if training_args.do_predict:
+        test_datasets_d = {}
         max_target_length = data_args.val_max_target_length
-        if "test" not in datasets:
-            raise ValueError("--do_predict requires a test dataset")
-        test_dataset = datasets["test"]
-        if data_args.max_test_samples is not None:
-            test_dataset = test_dataset.select(range(data_args.max_test_samples))
-        test_dataset = test_dataset.map(
-            preprocess_function,
-            batched=True,
-            num_proc=data_args.preprocessing_num_workers,
-            remove_columns=column_names,
-            load_from_cache_file=not data_args.overwrite_cache,
-        )
-
-    if data_args.iid_test_file is not None:
-        max_target_length = data_args.val_max_target_length
-        iid_test_dataset = datasets["iid_test"]
-        if data_args.max_test_samples is not None:
-            iid_test_dataset = iid_test_dataset.select(range(data_args.max_test_samples))
-        iid_test_dataset = iid_test_dataset.map(
-            preprocess_function,
-            batched=True,
-            num_proc=data_args.preprocessing_num_workers,
-            remove_columns=column_names,
-            load_from_cache_file=not data_args.overwrite_cache,
-        )
-    if data_args.exposure_examples_file is not None:
-        max_target_length = data_args.val_max_target_length
-        exposure_examples_dataset = datasets["exposure_examples"]
-        if data_args.max_test_samples is not None:
-            exposure_examples_dataset = exposure_examples_dataset.select(range(data_args.max_test_samples))
-        exposure_examples_dataset = exposure_examples_dataset.map(
-            preprocess_function,
-            batched=True,
-            num_proc=data_args.preprocessing_num_workers,
-            remove_columns=column_names,
-            load_from_cache_file=not data_args.overwrite_cache,
-        )
+        if not any([dname in datasets for dname in _VALID_TEST_DATASET_NAMES]):
+            raise ValueError("--do_predict requires a valid test dataset")
+        for dname in _VALID_TEST_DATASET_NAMES:
+            if dname not in datasets:
+                continue
+            test_dataset = datasets[dname]
+            if data_args.max_test_samples is not None:
+                test_dataset = test_dataset.select(range(data_args.max_test_samples))
+            test_dataset = test_dataset.map(
+                preprocess_function,
+                batched=True,
+                num_proc=data_args.preprocessing_num_workers,
+                remove_columns=column_names,
+                load_from_cache_file=not data_args.overwrite_cache,
+            )
+            test_datasets_d[dname] = test_dataset
 
     # Data collator
     label_pad_token_id = -100 if data_args.ignore_pad_token_for_loss else tokenizer.pad_token_id
@@ -625,7 +615,6 @@ def main():
 #        labels = [[label.strip()] for label in labels]
         preds = [pred for pred in preds]
         labels = [[label] for label in labels]
-
 
         return preds, labels
 
@@ -722,186 +711,95 @@ def main():
         trainer.save_metrics("eval", metrics)
 
     if training_args.do_predict:
-        logger.info("*** Test ***")
+        for test_dataset_name, test_dataset in test_datasets_d.items():
+            logger.info(f"*** Running predict on {test_dataset_name} ***")
 
-        test_results = trainer.predict(
-            test_dataset,
-            metric_key_prefix="test",
-            max_length=data_args.val_max_target_length,
-            num_beams=data_args.num_beams,
-        )
-        metrics = test_results.metrics
-        max_test_samples = data_args.max_test_samples if data_args.max_test_samples is not None else len(test_dataset)
-        metrics["test_samples"] = min(max_test_samples, len(test_dataset))
+            test_results = trainer.predict(
+                test_dataset,
+                metric_key_prefix=test_dataset_name,
+                max_length=data_args.val_max_target_length,
+                num_beams=data_args.num_beams,
+            )
+            metrics = test_results.metrics
+            max_test_samples = data_args.max_test_samples if data_args.max_test_samples is not None else len(test_dataset)
+            metrics[f"{test_dataset_name}_samples"] = min(max_test_samples, len(test_dataset))
 
-        trainer.log_metrics("test", metrics)
-        trainer.save_metrics("test", metrics)
+            trainer.log_metrics(test_dataset_name, metrics)
+            trainer.save_metrics(test_dataset_name, metrics)
 
-        # compute exact match accuracies by condition
-        test_labels = test_results.label_ids
-        if data_args.ignore_pad_token_for_loss:
-            # Replace -100 in the labels as we can't decode them.
-            test_labels = np.where(test_labels != -100, test_labels, tokenizer.pad_token_id)
+            # compute exact match accuracies by condition
+            test_labels = test_results.label_ids
+            if data_args.ignore_pad_token_for_loss:
+                # Replace -100 in the labels as we can't decode them.
+                test_labels = np.where(test_labels != -100, test_labels, tokenizer.pad_token_id)
 
-        test_predictions = test_results.predictions[:, 1:]
-        if isinstance(test_predictions, tuple):
-            test_predictions = test_predictions[0]
+            test_predictions = test_results.predictions[:, 1:]
+            if isinstance(test_predictions, tuple):
+                test_predictions = test_predictions[0]
 
-        print('Predictions:', test_predictions)
-        print('Labels:', test_labels)
+            print('Predictions:', test_predictions)
+            print('Labels:', test_labels)
 
-        accuracy_per_sequence = sequence_accuracy(test_predictions, test_labels, pad_token_id=tokenizer.pad_token_id)
-        exact_matches = (accuracy_per_sequence == 1.)       
+            accuracy_per_sequence = sequence_accuracy(test_predictions, test_labels, pad_token_id=tokenizer.pad_token_id)
+            exact_matches = (accuracy_per_sequence == 1.)       
 
-        if data_args.benchmark == 'COGS':
-            with open(data_args.gen_conditions_file, 'r') as f:
-                condition_list = json.load(f)
-            exact_match_acc_by_condition = {}
-            unique_conditions = list(set(condition_list))
-            for cond in unique_conditions:
-                idx = [i for i, x in enumerate(condition_list) if x == cond]
-                exact_match_acc_by_condition[cond] = exact_matches[idx].sum() / len(idx)
-        
-            # overall accuracy
-            exact_match_acc_by_condition["overall"] = exact_matches.sum() / len(exact_matches)
+            if data_args.benchmark == 'COGS':
+                # save results
+                save_filename = os.path.join(training_args.output_dir, f'accuracies_{test_dataset_name}_{os.path.basename(training_args.output_dir)}.json')
 
-            logger.info("Exact match accuries by condition: %s", exact_match_acc_by_condition)
+                if test_dataset_name == 'gen':
+                    with open(data_args.gen_conditions_file, 'r') as f:
+                        condition_list = json.load(f)
+                    exact_match_acc_by_condition = {}
+                    unique_conditions = list(set(condition_list))
+                    for cond in unique_conditions:
+                        idx = [i for i, x in enumerate(condition_list) if x == cond]
+                        exact_match_acc_by_condition[cond] = exact_matches[idx].sum() / len(idx)
+                
+                    # overall accuracy
+                    exact_match_acc_by_condition["overall"] = exact_matches.sum() / len(exact_matches)
 
-            # save results
-            save_filename = os.path.join(training_args.output_dir, f'accuracies_{os.path.basename(training_args.output_dir)}.json')
+                    logger.info("Exact match accuries by condition: %s", exact_match_acc_by_condition)
+                    exact_match_acc = exact_matches.sum() / len(exact_matches)
+                    logger.info(f"Exact match accuracy for {test_dataset_name}: {exact_match_acc}")
+ 
+                    with open(save_filename, 'w') as f:
+                        json.dump(exact_match_acc_by_condition, f)
 
-            with open(save_filename, 'w') as f:
-                json.dump(exact_match_acc_by_condition, f)
+                else:
+                    exact_match_acc = exact_matches.sum() / len(exact_matches)
+                    logger.info(f"Exact match accuracy for {test_dataset_name}: {exact_match_acc}")
+ 
+                    with open(save_filename, 'w') as f:
+                        json.dump(exact_match_acc, f)
 
-        elif data_args.benchmark == 'SCAN':
-            # overall accuracy
-            exact_match_acc = exact_matches.sum() / len(exact_matches)
 
-            logger.info("Exact match accuracy: %f", exact_match_acc)
+            elif data_args.benchmark == 'SCAN':
+                # overall accuracy
+                exact_match_acc = exact_matches.sum() / len(exact_matches)
 
-            # save results
-            save_filename = 'accuracy_{}.json'.format(training_args.output_dir)
+                logger.info("Exact match accuracy: %f", exact_match_acc)
 
-            with open(save_filename, 'w') as f:
-                json.dump(exact_match_acc, f)
+                # save results
+                save_filename = 'accuracy_{}.json'.format(training_args.output_dir)
 
-        # generate predictions 
-        if trainer.is_world_process_zero():
-            if training_args.predict_with_generate:
-                test_preds = tokenizer.batch_decode(test_results.predictions, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-                test_preds = [pred for pred in test_preds]
-                #test_preds = [pred.strip() for pred in test_preds]
-                test_labels = tokenizer.batch_decode(test_labels, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-                #test_labels = [pred.strip() for pred in test_labels]
-                test_labels = [pred for pred in test_labels]
-                output_test_preds_file = os.path.join(training_args.output_dir, "gen_generations.tsv")
-                with open(output_test_preds_file, "w") as writer:
-                    writer.write('prediction\tgold\n')
-                    for pred, label in zip(test_preds, test_labels):
-                        writer.write(f'{pred}\t{label}\n')
-        
-    if data_args.iid_test_file is not None:
-        logger.info("*** IID Test ***")
+                with open(save_filename, 'w') as f:
+                    json.dump(exact_match_acc, f)
 
-        iid_test_results = trainer.predict(
-            iid_test_dataset,
-            metric_key_prefix="iid_test",
-            max_length=data_args.val_max_target_length,
-            num_beams=data_args.num_beams,
-        )
-        metrics = iid_test_results.metrics
-        max_iid_test_samples = data_args.max_test_samples if data_args.max_test_samples is not None else len(iid_test_results)
-        metrics["iid_test_samples"] = min(max_iid_test_samples, len(iid_test_dataset))
-
-        trainer.log_metrics("iid_test", metrics)
-        trainer.save_metrics("iid_test", metrics)
-
-        # compute exact match accuracies by condition
-        iid_test_labels = iid_test_results.label_ids
-        if data_args.ignore_pad_token_for_loss:
-            # Replace -100 in the labels as we can't decode them.
-            iid_test_labels = np.where(iid_test_labels != -100, iid_test_labels, tokenizer.pad_token_id)
-
-        iid_test_predictions = iid_test_results.predictions[:, 1:]
-        if isinstance(iid_test_predictions, tuple):
-            iid_test_predictions = iid_test_predictions[0]
-
-        print('Predictions:', iid_test_predictions)
-        print('Labels:', iid_test_labels)
-
-        iid_accuracy_per_sequence = sequence_accuracy(iid_test_predictions, iid_test_labels, pad_token_id=tokenizer.pad_token_id)
-        iid_exact_matches = (iid_accuracy_per_sequence == 1.)    
-        iid_exact_match_acc = iid_exact_matches.sum() / len(iid_exact_matches)
-        logger.info("Exact match accuracy: %s", iid_exact_match_acc)   
-        iid_save_filename = os.path.join(training_args.output_dir, f'accuracies_iid_test_{os.path.basename(training_args.output_dir)}.json')
-
-        with open(iid_save_filename, 'w') as f:
-            json.dump({'iid_test': iid_exact_match_acc}, f)
-
-        # generate predictions 
-        if trainer.is_world_process_zero():
-            if training_args.predict_with_generate:
-                iid_test_preds = tokenizer.batch_decode(iid_test_results.predictions, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-                #iid_test_preds = [pred.strip() for pred in iid_test_preds]
-                iid_test_preds = [pred for pred in iid_test_preds]
-                iid_test_labels = tokenizer.batch_decode(iid_test_labels, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-                #iid_test_labels = [pred.strip() for pred in iid_test_labels]
-                iid_test_labels = [pred for pred in iid_test_labels]
-                output_iid_test_preds_file = os.path.join(training_args.output_dir, "iid_test_generations.tsv")
-                with open(output_iid_test_preds_file, "w") as writer:
-                    writer.write('prediction\tgold\n')
-                    for pred, label in zip(iid_test_preds, iid_test_labels):
-                        writer.write(f'{pred}\t{label}\n')
-               
-    if data_args.exposure_examples_file is not None:
-        logger.info("*** Exposure Examples ***")
-
-        exposure_examples_results = trainer.predict(
-            exposure_examples_dataset,
-            metric_key_prefix="exposure_examples",
-            max_length=data_args.val_max_target_length,
-            num_beams=data_args.num_beams,
-        )
-        metrics = exposure_examples_results.metrics
-        max_exposure_examples_samples = data_args.max_test_samples if data_args.max_test_samples is not None else len(exposure_examples_results)
-        metrics["exposure_examples_samples"] = min(max_exposure_examples_samples, len(exposure_examples_dataset))
-
-        trainer.log_metrics("exposure_examples", metrics)
-        trainer.save_metrics("exposure_examples", metrics)
-
-        # compute exact match accuracies by condition
-        exposure_examples_labels = exposure_examples_results.label_ids
-        if data_args.ignore_pad_token_for_loss:
-            # Replace -100 in the labels as we can't decode them.
-            exposure_examples_labels = np.where(exposure_examples_labels != -100, exposure_examples_labels, tokenizer.pad_token_id)
-
-        exposure_examples_predictions = exposure_examples_results.predictions[:, 1:]
-        if isinstance(exposure_examples_predictions, tuple):
-            exposure_examples_predictions = exposure_examples_predictions[0]
-
-        exposure_examples_accuracy_per_sequence = sequence_accuracy(exposure_examples_predictions, exposure_examples_labels, pad_token_id=tokenizer.pad_token_id)
-        exposure_examples_exact_matches = (exposure_examples_accuracy_per_sequence == 1.)    
-        exposure_examples_exact_match_acc = exposure_examples_exact_matches.sum() / len(exposure_examples_exact_matches)
-        logger.info("Exact match accuracy: %s", exposure_examples_exact_match_acc)   
-        exposure_examples_save_filename = os.path.join(training_args.output_dir, f'accuracies_exposure_examples_{os.path.basename(training_args.output_dir)}.json')
-
-        with open(exposure_examples_save_filename, 'w') as f:
-            json.dump({'exposure_examples': exposure_examples_exact_match_acc}, f)
-
-        # generate predictions 
-        if trainer.is_world_process_zero():
-            if training_args.predict_with_generate:
-                exposure_examples_preds = tokenizer.batch_decode(exposure_examples_results.predictions, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-                exposure_examples_preds = [pred for pred in exposure_examples_preds]
-                #exposure_examples_preds = [pred.strip() for pred in exposure_examples_preds]
-                exposure_examples_labels = tokenizer.batch_decode(exposure_examples_labels, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-                #exposure_examples_labels = [pred.strip() for pred in exposure_examples_labels]
-                exposure_examples_labels = [pred for pred in exposure_examples_labels]
-                output_exposure_examples_preds_file = os.path.join(training_args.output_dir, "exposure_examples_generations.tsv")
-                with open(output_exposure_examples_preds_file, "w") as writer:
-                    writer.write('prediction\tgold\n')
-                    for pred, label in zip(exposure_examples_preds, exposure_examples_labels):
-                        writer.write(f'{pred}\t{label}\n')
+            # generate predictions 
+            if trainer.is_world_process_zero():
+                if training_args.predict_with_generate:
+                    test_preds = tokenizer.batch_decode(test_results.predictions, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+                    test_preds = [pred for pred in test_preds]
+                    #test_preds = [pred.strip() for pred in test_preds]
+                    test_labels = tokenizer.batch_decode(test_labels, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+                    #test_labels = [pred.strip() for pred in test_labels]
+                    test_labels = [pred for pred in test_labels]
+                    output_test_preds_file = os.path.join(training_args.output_dir, f"generations_{test_dataset_name}.tsv")
+                    with open(output_test_preds_file, "w") as writer:
+                        writer.write('prediction\tgold\n')
+                        for pred, label in zip(test_preds, test_labels):
+                            writer.write(f'{pred}\t{label}\n')
 
     return results
 
