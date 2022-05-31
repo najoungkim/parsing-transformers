@@ -154,6 +154,12 @@ class DataTrainingArguments:
         metadata={
             "help": "An optional input test data file (iid) to evaluate the metrics (sacreblue) on " "a jsonlines file."
         },
+    )
+    exposure_examples_file: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "An optional input test data file (exposure examples only) to evaluate the metrics (sacreblue) on " "a jsonlines file."
+        },
     )    
     overwrite_cache: bool = field(
         default=False, metadata={"help": "Overwrite the cached training and evaluation sets"}
@@ -326,6 +332,9 @@ def main():
         if data_args.iid_test_file is not None:
             data_files["iid_test"] = data_args.iid_test_file
             extension = data_args.iid_test_file.split(".")[-1]
+        if data_args.exposure_examples_file is not None:
+            data_files["exposure_examples"] = data_args.exposure_examples_file
+            extension = data_args.exposure_examples_file.split(".")[-1]
         datasets = load_dataset(extension, data_files=data_files)
 
     # Load pretrained model and tokenizer
@@ -381,10 +390,7 @@ def main():
             for line in vocab_file:
                 w = line.rstrip('\n')
                 if model_args.prepend_space_to_vocab:
-                    if 't5' in model_args.model_name_or_path:
-                        new_vocabs.append(' ' + w)
-                    elif 'bart' in model_args.model_name_or_path:
-                        new_vocabs.append('\u0120' + w)
+                    new_vocabs.append(' ' + w)
                 else:
                     new_vocabs.append(w)
         for w in new_vocabs:
@@ -483,6 +489,8 @@ def main():
         column_names = datasets["test"].column_names
     elif data_args.iid_test_file is not None:
         column_names = datasets["iid_test"].column_names
+    elif data_args.exposure_examples_file is not None:
+        column_names = datasets["exposure_examples"].column_names
     else:
         logger.info("There is nothing to do. Please pass `do_train`, `do_eval` and/or `do_predict`.")
         return
@@ -584,6 +592,18 @@ def main():
             remove_columns=column_names,
             load_from_cache_file=not data_args.overwrite_cache,
         )
+    if data_args.exposure_examples_file is not None:
+        max_target_length = data_args.val_max_target_length
+        exposure_examples_dataset = datasets["exposure_examples"]
+        if data_args.max_test_samples is not None:
+            exposure_examples_dataset = exposure_examples_dataset.select(range(data_args.max_test_samples))
+        exposure_examples_dataset = exposure_examples_dataset.map(
+            preprocess_function,
+            batched=True,
+            num_proc=data_args.preprocessing_num_workers,
+            remove_columns=column_names,
+            load_from_cache_file=not data_args.overwrite_cache,
+        )
 
     # Data collator
     label_pad_token_id = -100 if data_args.ignore_pad_token_for_loss else tokenizer.pad_token_id
@@ -601,8 +621,11 @@ def main():
     metric = load_metric("sacrebleu")
 
     def postprocess_text(preds, labels):
-        preds = [pred.strip() for pred in preds]
-        labels = [[label.strip()] for label in labels]
+#        preds = [pred.strip() for pred in preds]
+#        labels = [[label.strip()] for label in labels]
+        preds = [pred for pred in preds]
+        labels = [[label] for label in labels]
+
 
         return preds, labels
 
@@ -766,9 +789,11 @@ def main():
         if trainer.is_world_process_zero():
             if training_args.predict_with_generate:
                 test_preds = tokenizer.batch_decode(test_results.predictions, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-                test_preds = [pred.strip() for pred in test_preds]
+                test_preds = [pred for pred in test_preds]
+                #test_preds = [pred.strip() for pred in test_preds]
                 test_labels = tokenizer.batch_decode(test_labels, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-                test_labels = [pred.strip() for pred in test_labels]
+                #test_labels = [pred.strip() for pred in test_labels]
+                test_labels = [pred for pred in test_labels]
                 output_test_preds_file = os.path.join(training_args.output_dir, "gen_generations.tsv")
                 with open(output_test_preds_file, "w") as writer:
                     writer.write('prediction\tgold\n')
@@ -817,10 +842,66 @@ def main():
         if trainer.is_world_process_zero():
             if training_args.predict_with_generate:
                 iid_test_preds = tokenizer.batch_decode(iid_test_results.predictions, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-                iid_test_preds = [pred.strip() for pred in iid_test_preds]
-                output_iid_test_preds_file = os.path.join(training_args.output_dir, "iid_test_generations.txt")
+                #iid_test_preds = [pred.strip() for pred in iid_test_preds]
+                iid_test_preds = [pred for pred in iid_test_preds]
+                iid_test_labels = tokenizer.batch_decode(iid_test_labels, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+                #iid_test_labels = [pred.strip() for pred in iid_test_labels]
+                iid_test_labels = [pred for pred in iid_test_labels]
+                output_iid_test_preds_file = os.path.join(training_args.output_dir, "iid_test_generations.tsv")
                 with open(output_iid_test_preds_file, "w") as writer:
-                    writer.write("\n".join(iid_test_preds))            
+                    writer.write('prediction\tgold\n')
+                    for pred, label in zip(iid_test_preds, iid_test_labels):
+                        writer.write(f'{pred}\t{label}\n')
+               
+    if data_args.exposure_examples_file is not None:
+        logger.info("*** Exposure Examples ***")
+
+        exposure_examples_results = trainer.predict(
+            exposure_examples_dataset,
+            metric_key_prefix="exposure_examples",
+            max_length=data_args.val_max_target_length,
+            num_beams=data_args.num_beams,
+        )
+        metrics = exposure_examples_results.metrics
+        max_exposure_examples_samples = data_args.max_test_samples if data_args.max_test_samples is not None else len(exposure_examples_results)
+        metrics["exposure_examples_samples"] = min(max_exposure_examples_samples, len(exposure_examples_dataset))
+
+        trainer.log_metrics("exposure_examples", metrics)
+        trainer.save_metrics("exposure_examples", metrics)
+
+        # compute exact match accuracies by condition
+        exposure_examples_labels = exposure_examples_results.label_ids
+        if data_args.ignore_pad_token_for_loss:
+            # Replace -100 in the labels as we can't decode them.
+            exposure_examples_labels = np.where(exposure_examples_labels != -100, exposure_examples_labels, tokenizer.pad_token_id)
+
+        exposure_examples_predictions = exposure_examples_results.predictions[:, 1:]
+        if isinstance(exposure_examples_predictions, tuple):
+            exposure_examples_predictions = exposure_examples_predictions[0]
+
+        exposure_examples_accuracy_per_sequence = sequence_accuracy(exposure_examples_predictions, exposure_examples_labels, pad_token_id=tokenizer.pad_token_id)
+        exposure_examples_exact_matches = (exposure_examples_accuracy_per_sequence == 1.)    
+        exposure_examples_exact_match_acc = exposure_examples_exact_matches.sum() / len(exposure_examples_exact_matches)
+        logger.info("Exact match accuracy: %s", exposure_examples_exact_match_acc)   
+        exposure_examples_save_filename = os.path.join(training_args.output_dir, f'accuracies_exposure_examples_{os.path.basename(training_args.output_dir)}.json')
+
+        with open(exposure_examples_save_filename, 'w') as f:
+            json.dump({'exposure_examples': exposure_examples_exact_match_acc}, f)
+
+        # generate predictions 
+        if trainer.is_world_process_zero():
+            if training_args.predict_with_generate:
+                exposure_examples_preds = tokenizer.batch_decode(exposure_examples_results.predictions, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+                exposure_examples_preds = [pred for pred in exposure_examples_preds]
+                #exposure_examples_preds = [pred.strip() for pred in exposure_examples_preds]
+                exposure_examples_labels = tokenizer.batch_decode(exposure_examples_labels, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+                #exposure_examples_labels = [pred.strip() for pred in exposure_examples_labels]
+                exposure_examples_labels = [pred for pred in exposure_examples_labels]
+                output_exposure_examples_preds_file = os.path.join(training_args.output_dir, "exposure_examples_generations.tsv")
+                with open(output_exposure_examples_preds_file, "w") as writer:
+                    writer.write('prediction\tgold\n')
+                    for pred, label in zip(exposure_examples_preds, exposure_examples_labels):
+                        writer.write(f'{pred}\t{label}\n')
 
     return results
 
