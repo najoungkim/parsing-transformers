@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import numpy as np
-from datasets import load_dataset, load_metric
+from datasets import load_dataset
 
 import transformers
 from transformers import (
@@ -363,7 +363,8 @@ def main():
         use_fast=model_args.use_fast_tokenizer,
         revision=model_args.model_revision,
         use_auth_token=True if model_args.use_auth_token else None,
-        from_slow=not model_args.use_fast_tokenizer
+        from_slow=not model_args.use_fast_tokenizer,
+        model_max_length=max(data_args.max_source_length, data_args.max_target_length)
     )
     if model_args.use_pretrained_weights:
         model = AutoModelForSeq2SeqLM.from_pretrained(
@@ -608,7 +609,7 @@ def main():
         )
 
     # Metric
-    metric = load_metric("sacrebleu")
+    # metric = load_metric("sacrebleu")
 
     def postprocess_text(preds, labels):
 #        preds = [pred.strip() for pred in preds]
@@ -653,8 +654,9 @@ def main():
         # Some simple post-processing
         decoded_preds, decoded_labels = postprocess_text(decoded_preds, decoded_labels)
 
-        result = metric.compute(predictions=decoded_preds, references=decoded_labels)
-        result = {"bleu": result["score"]}
+        # result = metric.compute(predictions=decoded_preds, references=decoded_labels)
+        # result = {"bleu": result["score"]}
+        result = {}
 
         prediction_lens = [np.count_nonzero(pred != tokenizer.pad_token_id) for pred in preds]
         result["gen_len"] = np.mean(prediction_lens)
@@ -695,10 +697,12 @@ def main():
         trainer.log_metrics("train", metrics)
         trainer.save_metrics("train", metrics)
         trainer.save_state()
+        with open(os.path.join(training_args.output_dir, 'training_log.json'), 'w') as wf:
+            json.dump(trainer.state.log_history, wf)
 
     # Evaluation
     results = {}
-    if training_args.do_eval:
+    if training_args.do_eval and data_args.benchmark != "COGS":
         logger.info("*** Evaluate ***")
 
         metrics = trainer.evaluate(
