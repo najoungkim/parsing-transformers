@@ -403,6 +403,12 @@ def main():
             for line in vocab_file:
                 w = line.rstrip('\n')
                 if model_args.prepend_space_to_vocab:
+                    # We use the normal whitespace token instead of \u2581 which is the
+                    # canonical whitespace token for T5 Tokenizer, because
+                    # in lower versions of Transformers adding tokens with \u2581 prepended
+                    # does not result in correct tokenization.
+                    # We checked that this issue exists in transformers==4.11.0.dev0 but
+                    # not in v4.19.2.
                     new_vocabs.append(' ' + w)
                 else:
                     new_vocabs.append(w)
@@ -681,12 +687,12 @@ def main():
         if last_checkpoint is not None:
             checkpoint = last_checkpoint
         # Need sanity check
-        # elif os.path.isdir(model_args.model_name_or_path):
-        #    checkpoint = model_args.model_name_or_path
+        elif os.path.isdir(model_args.model_name_or_path) and 't5_small_lm_pretrained' not in model_args.model_name_or_path:
+            checkpoint = model_args.model_name_or_path
         else:
             checkpoint = None
         train_result = trainer.train(resume_from_checkpoint=checkpoint)
-        trainer.save_model()  # Saves the tokenizer too for easy upload
+ #       trainer.save_model()  # Saves the tokenizer too for easy upload
 
         metrics = train_result.metrics
         max_train_samples = (
@@ -696,7 +702,7 @@ def main():
 
         trainer.log_metrics("train", metrics)
         trainer.save_metrics("train", metrics)
-        trainer.save_state()
+#        trainer.save_state()
         with open(os.path.join(training_args.output_dir, 'training_log.json'), 'w') as wf:
             json.dump(trainer.state.log_history, wf)
 
