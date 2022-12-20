@@ -52,6 +52,7 @@ from transformers.utils import check_min_version
 
 _T5_EMB_SIZE = 32128
 _BART_EMB_SIZE = 50265
+_LED_EMB_SIZE = 50265
 _VALID_TEST_DATASET_NAMES = ["gen", "iid_test", "exposure_examples", "iid_test_novel_words"]
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
@@ -242,6 +243,7 @@ class DataTrainingArguments:
     source_prefix: Optional[str] = field(
         default=None, metadata={"help": "A prefix to add before every source text (useful for T5 models)."}
     )
+    
 
     def __post_init__(self):
         if self.dataset_name is None and self.train_file is None and self.validation_file is None:
@@ -373,7 +375,7 @@ def main():
             config=config,
             cache_dir=model_args.cache_dir,
             revision=model_args.model_revision,
-            use_auth_token=True if model_args.use_auth_token else None
+            use_auth_token=True if model_args.use_auth_token else None,
         )
     else:
         print('Using a model with random weights')
@@ -398,6 +400,10 @@ def main():
 
     # Add vocab
     if model_args.add_new_vocab is not None:
+        if 't5' in model_args.model_name_or_path:
+            model.resize_token_embeddings(len(tokenizer))
+            print(f'Cutting spurious emb dimensions for T5 to {len(tokenizer)}.')
+
         new_vocabs = []
         with open(model_args.add_new_vocab) as vocab_file:
             for line in vocab_file:
@@ -406,25 +412,45 @@ def main():
                     # We use the normal whitespace token instead of \u2581 which is the
                     # canonical whitespace token for T5 Tokenizer, because
                     # in lower versions of Transformers adding tokens with \u2581 prepended
-                    # does not result in correct tokenization.
+                    # does not result in correct tokenization. 
                     # We checked that this issue exists in transformers==4.11.0.dev0 but
                     # not in v4.19.2.
                     new_vocabs.append(' ' + w)
+                    # new_vocabs.append('\u2581' + w)
                 else:
                     new_vocabs.append(w)
         for w in new_vocabs:
             tokenizer.add_tokens([w])
             print(f'Added {w} to vocab.')
-
+            if model_args.prepend_space_to_vocab:
+                print(tokenizer.tokenize(f'{w} danced'), tokenizer.encode(f'{w} danced'))
+                print(tokenizer.tokenize(f'A{w} danced'), tokenizer.encode(f'A{w} danced'))
+            else:
+                print(tokenizer.tokenize(f'{w} danced'), tokenizer.encode(f'{w} danced'))
+                print(tokenizer.tokenize(f' {w} danced'), tokenizer.encode(f' {w} danced'))
+                print(tokenizer.tokenize(f'A {w} danced'), tokenizer.encode(f'A {w} danced'))
+                        
         if 't5' in model_args.model_name_or_path:
-            model.resize_token_embeddings(_T5_EMB_SIZE + len(new_vocabs))
+#            model.resize_token_embeddings(_T5_EMB_SIZE + len(new_vocabs))
+            model.resize_token_embeddings(len(tokenizer))
+            print(f'Resizing embedding layer to {len(tokenizer)} after adding new vocabs.')
         elif 'bart' in model_args.model_name_or_path:
             model.resize_token_embeddings(_BART_EMB_SIZE + len(new_vocabs))
+        elif 'allenai/led' in model_args.model_name_or_path:
+            model.resize_token_embeddings(_LED_EMB_SIZE + len(new_vocabs))
         else:
-            raise ValueError('Only T5 and BART are currently supported for vocab resizing.')
+            raise ValueError('Only T5, BART and LED are currently supported for vocab resizing.')
 
         print(f'Added {len(new_vocabs)} vocabulary items.')
 
+#        if 't5' in model_args.model_name_or_path and model_args.vocab_init_method == 'default':
+#            import torch
+#            emb = model.get_input_embeddings()
+#            print(emb.weight.data.shape)
+#            print(emb.weight.data[-len(new_vocabs):,:])
+#            emb.weight.data[-len(new_vocabs):,:].normal_(mean=0.0, std=1.0)
+#            model.set_input_embeddings(emb)
+#            print(emb.weight.data[-len(new_vocabs):,:])
         if model_args.vocab_init_method == 'avg':
             print('Re-initializing new embeddings with average init.')
             # Try https://nlp.stanford.edu/~johnhew/vocab-expansion.html
@@ -442,7 +468,19 @@ def main():
             model.set_input_embeddings(emb)
             print(old_emb)
             print(new_emb)
-        
+        elif model_args.vocab_init_method == 'existing_word':
+            import torch
+            old_idx_range = range(0, len(tokenizer) - len(new_vocabs))
+            rand_indices = np.random.choice(old_idx_range, len(new_vocabs), replace=False)
+            emb = model.get_input_embeddings()
+            old_emb = emb.weight.data[:-len(new_vocabs), :]
+            new_emb = torch.stack(tuple((emb.weight.data[ridx, :] for ridx in rand_indices)), dim=0)
+            emb.weight.data[-len(new_vocabs):,:] = new_emb
+            model.set_input_embeddings(emb)
+            print(old_emb)
+            print(new_emb)
+        else:
+            print(model.get_input_embeddings().weight.data[-len(new_vocabs):, :])
 
     # print out model for inspection
     print(model)
